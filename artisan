@@ -1,0 +1,189 @@
+#!/usr/bin/env php
+<?php
+/**
+ * artisan - mô phỏng Laravel artisan CLI cho POC
+ *
+ * Hỗ trợ các command mà Ansible playbook gọi:
+ *   - down [--retry=N] [--message="..."]   tạo file maintenance flag
+ *   - up                                   xoá file maintenance flag
+ *   - migrate [--force]                    chạy SQL migrations
+ *   - migrate:status                       liệt kê migrations và trạng thái
+ *   - tinker --execute="<php code>"        eval 1 đoạn PHP với DB và app() có sẵn
+ *   - config:cache | route:cache | view:cache  no-op (chỉ in success)
+ */
+
+require __DIR__ . '/vendor/autoload.php';
+
+if (file_exists(__DIR__ . '/.env')) {
+    $dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
+    $dotenv->safeLoad();
+}
+
+$basePath = __DIR__;
+$cmd = $argv[1] ?? '';
+
+function db(): PDO {
+    $host = $_ENV['DB_HOST'] ?? '127.0.0.1';
+    $port = $_ENV['DB_PORT'] ?? '3306';
+    $name = $_ENV['DB_DATABASE'] ?? '';
+    $user = $_ENV['DB_USERNAME'] ?? '';
+    $pass = $_ENV['DB_PASSWORD'] ?? '';
+    return new PDO(
+        "mysql:host=$host;port=$port;dbname=$name;charset=utf8mb4",
+        $user,
+        $pass,
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+    );
+}
+
+function getArg(array $argv, string $flag, $default = null) {
+    foreach ($argv as $a) {
+        if ($a === $flag) return true;
+        if (strpos($a, $flag . '=') === 0) {
+            return substr($a, strlen($flag) + 1);
+        }
+    }
+    return $default;
+}
+
+switch ($cmd) {
+    case 'down':
+        @mkdir("$basePath/storage/framework", 0755, true);
+        $msg = getArg($argv, '--message', 'Đang cập nhật hệ thống');
+        $retry = getArg($argv, '--retry', 60);
+        file_put_contents("$basePath/storage/framework/down", json_encode([
+            'time'    => time(),
+            'message' => $msg,
+            'retry'   => (int)$retry,
+        ]));
+        echo "Application is now in maintenance mode.\n";
+        break;
+
+    case 'up':
+        @unlink("$basePath/storage/framework/down");
+        echo "Application is now live.\n";
+        break;
+
+    case 'migrate':
+        $pdo = db();
+        $pdo->exec("CREATE TABLE IF NOT EXISTS migrations (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            migration VARCHAR(255) NOT NULL UNIQUE,
+            batch INT NOT NULL
+        )");
+        $applied = $pdo->query("SELECT migration FROM migrations")
+                       ->fetchAll(PDO::FETCH_COLUMN);
+        $files = glob("$basePath/database/migrations/*.sql");
+        sort($files);
+        $batch = ((int)$pdo->query("SELECT COALESCE(MAX(batch),0) FROM migrations")->fetchColumn()) + 1;
+        $ran = 0;
+        foreach ($files as $file) {
+            $name = basename($file, '.sql');
+            if (in_array($name, $applied, true)) continue;
+            echo "Migrating: $name\n";
+            $sql = file_get_contents($file);
+            $pdo->exec($sql);
+            $stmt = $pdo->prepare("INSERT INTO migrations (migration, batch) VALUES (?, ?)");
+            $stmt->execute([$name, $batch]);
+            echo "Migrated:  $name\n";
+            $ran++;
+        }
+        if ($ran === 0) echo "Nothing to migrate.\n";
+        break;
+
+    case 'migrate:status':
+        $pdo = db();
+        $pdo->exec("CREATE TABLE IF NOT EXISTS migrations (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            migration VARCHAR(255) NOT NULL UNIQUE,
+            batch INT NOT NULL
+        )");
+        $applied = $pdo->query("SELECT migration FROM migrations")
+                       ->fetchAll(PDO::FETCH_COLUMN);
+        $files = glob("$basePath/database/migrations/*.sql");
+        sort($files);
+        echo "+------+------------------------------------------+\n";
+        echo "| Ran? | Migration                                |\n";
+        echo "+------+------------------------------------------+\n";
+        foreach ($files as $file) {
+            $name = basename($file, '.sql');
+            $ran = in_array($name, $applied, true) ? 'Y' : 'N';
+            printf("| %s    | %-40s |\n", $ran, $name);
+        }
+        echo "+------+------------------------------------------+\n";
+        break;
+
+    case 'tinker':
+        $code = getArg($argv, '--execute');
+        if ($code === null) {
+            // Hỗ trợ syntax: artisan tinker --execute "code"
+            $idx = array_search('--execute', $argv, true);
+            if ($idx !== false && isset($argv[$idx + 1])) {
+                $code = $argv[$idx + 1];
+            }
+        }
+        if ($code === null || $code === true) {
+            fwrite(STDERR, "tinker requires --execute=\"<php code>\"\n");
+            exit(1);
+        }
+        // Cung cấp shim cho app() và DB facade
+        $shim = '
+        if (!function_exists("app")) {
+            function app() {
+                return new class {
+                    public function version() { return "5.5.0"; }
+                };
+            }
+        }
+        if (!class_exists("DB")) {
+            class DB {
+                private static $pdo = null;
+                public static function pdoInstance() {
+                    if (self::$pdo === null) self::$pdo = db();
+                    return self::$pdo;
+                }
+                public static function connection() {
+                    return new class {
+                        public function getPdo() { return DB::pdoInstance(); }
+                    };
+                }
+                public static function table($name) {
+                    return new class($name) {
+                        private $t;
+                        public function __construct($t) { $this->t = $t; }
+                        public function count() {
+                            return (int) DB::pdoInstance()
+                                ->query("SELECT COUNT(*) FROM `" . $this->t . "`")
+                                ->fetchColumn();
+                        }
+                    };
+                }
+            }
+        }
+        ';
+        eval($shim . $code);
+        echo "\n";
+        break;
+
+    case 'config:cache':
+    case 'route:cache':
+    case 'view:cache':
+        echo "Configuration cached successfully.\n";
+        break;
+
+    case '':
+    case '--help':
+    case '-h':
+        echo "Available commands:\n";
+        echo "  down [--retry=N] [--message=...]\n";
+        echo "  up\n";
+        echo "  migrate [--force]\n";
+        echo "  migrate:status\n";
+        echo "  tinker --execute=\"<php code>\"\n";
+        echo "  config:cache | route:cache | view:cache\n";
+        break;
+
+    default:
+        fwrite(STDERR, "Command \"$cmd\" is not defined.\n");
+        exit(1);
+}

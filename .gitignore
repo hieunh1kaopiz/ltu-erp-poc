@@ -1,0 +1,16 @@
+/node_modules
+/vendor
+/public/css
+/public/js
+/public/mix-manifest.json
+/storage/framework/sessions/sess_*
+/storage/framework/views/*.php
+/storage/framework/cache/*
+/storage/framework/down
+/storage/logs/*
+.env
+.env.backup
+.phpunit.result.cache
+.DS_Store
+Thumbs.db
+mix-manifest.json
